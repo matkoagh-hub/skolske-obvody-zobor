@@ -157,127 +157,115 @@ obvody.forEach((o, i) => {
   detailsEl.appendChild(det);
 });
 
-// Cache cez localStorage
-// Returns: undefined = nikdy nehľadané, null = hľadané & nenájdené, object = nájdené
+// Cache: undefined = nikdy nehľadané, null = nenájdené, array = nájdené (Overpass geometria)
+// Prefix v2 invaliduje starý Nominatim cache
+const CACHE_PFX = 'zobor2_';
 function cacheGet(key) {
   try {
-    const raw = localStorage.getItem('zobor_' + key);
+    const raw = localStorage.getItem(CACHE_PFX + key);
     if (raw === null) return undefined;
     return JSON.parse(raw);
   } catch { return undefined; }
 }
 function cacheSet(key, val) {
-  try { localStorage.setItem('zobor_' + key, JSON.stringify(val)); } catch {}
+  try { localStorage.setItem(CACHE_PFX + key, JSON.stringify(val)); } catch {}
 }
 
-const viewbox = '18.02,48.40,18.20,48.28';
 const allBounds = [];
 let totalDone = 0, totalFound = 0;
 const totalStreets = obvody.reduce((a,o) => a + o.streets.length, 0);
 
-async function geocodeStreet(streetName) {
-  const cached = cacheGet(streetName);
-  if (cached !== undefined) return cached;  // null = nenájdené (z cache), objekt = nájdené
-
-  const queries = [
-    `${streetName} ulica, Nitra, Slovensko`,
-    `${streetName}, Nitra`,
-    `${streetName}, Zobor, Nitra`
-  ];
-  for (const q of queries) {
-    let retryDelay = 5000;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      try {
-        const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=3&viewbox=${viewbox}&bounded=1&polygon_geojson=1&accept-language=sk`;
-        const r = await fetch(url);
-        if (r.status === 429 || r.status === 403) {
-          await new Promise(res => setTimeout(res, retryDelay));
-          retryDelay *= 2;
-          continue;  // znova skús TEN ISTÝ dopyt
-        }
-        if (!r.ok) break;  // prejdi na ďalší formát dopytu
-        const data = await r.json();
-        if (data && data.length > 0) {
-          cacheSet(streetName, data[0]);
-          return data[0];
-        }
-        break;  // žiadne výsledky, skús ďalší formát
-      } catch (e) {
-        console.warn('Error:', e);
-        break;
-      }
-    }
-  }
-  cacheSet(streetName, null);  // zaznač že sa nenašlo
-  return null;
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function drawResult(result, streetName, obvod) {
-  const lat = parseFloat(result.lat), lon = parseFloat(result.lon);
-  allBounds.push([lat, lon]);
+async function fetchOverpass(streetNames) {
+  const pattern = streetNames.map(escapeRegex).join('|');
+  // bbox: juh,západ,sever,východ — oblasť Nitra/Zobor
+  const query = `[out:json][timeout:90][bbox:48.28,18.02,48.40,18.20];
+way["highway"]["name"~"^(${pattern})$"];
+out geom;`;
+  const resp = await fetch('https://overpass-api.de/api/interpreter', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'data=' + encodeURIComponent(query)
+  });
+  if (!resp.ok) throw new Error(`Overpass ${resp.status}`);
+  return resp.json();
+}
+
+function drawWays(wayGeometries, streetName, obvod) {
   const popup = `<b>${streetName}</b><br>${obvod.name}`;
-  
-  if (result.geojson && (result.geojson.type === 'LineString' || result.geojson.type === 'MultiLineString')) {
-    L.geoJSON(result.geojson, { style: { color: obvod.color, weight: 5, opacity: 0.85 }})
+  for (const geom of wayGeometries) {
+    const coords = geom.map(pt => [pt.lat, pt.lon]);
+    allBounds.push(coords[0], coords[coords.length - 1]);
+    L.polyline(coords, { color: obvod.color, weight: 5, opacity: 0.85 })
       .bindPopup(popup).addTo(layerGroups[obvod.name]);
-  } else if (result.geojson && result.geojson.type === 'Polygon') {
-    L.geoJSON(result.geojson, { style: { color: obvod.color, weight: 2, fillOpacity: 0.3 }})
-      .bindPopup(popup).addTo(layerGroups[obvod.name]);
-  } else {
-    L.circleMarker([lat, lon], {
-      radius: 7, color: '#1d1d1d', weight: 1.5,
-      fillColor: obvod.color, fillOpacity: 0.9
-    }).bindPopup(popup).addTo(layerGroups[obvod.name]);
   }
 }
 
 async function processAll() {
-  statusEl.innerHTML = `Načítavam ulice z OpenStreetMap…<br>
-    <progress id="prog" max="${totalStreets}" value="0"></progress>
-    <div id="progtxt" style="font-size:11px;margin-top:4px;"></div>`;
-  const prog = document.getElementById('prog');
-  const progtxt = document.getElementById('progtxt');
+  // Zisti ktoré ulice nie sú v cache
+  const uniqueNames = [...new Set(obvody.flatMap(o => o.streets))];
+  const uncached = uniqueNames.filter(n => cacheGet(n) === undefined);
 
+  if (uncached.length > 0) {
+    // Stiahni v dávkach po 60 (dlhý regex môže spomaľovať Overpass)
+    const BATCH = 60;
+    const batches = Math.ceil(uncached.length / BATCH);
+    for (let b = 0; b < uncached.length; b += BATCH) {
+      const batch = uncached.slice(b, b + BATCH);
+      const batchNum = Math.floor(b / BATCH) + 1;
+      statusEl.innerHTML = batches > 1
+        ? `Sťahujem dáta… dávka ${batchNum}/${batches}`
+        : `Sťahujem dáta pre ${uncached.length} ulíc z OpenStreetMap…`;
+      try {
+        const data = await fetchOverpass(batch);
+        // Zoskup cesty podľa mena; ulož len geometriu (šetrí miesto v cache)
+        const byName = {};
+        for (const el of data.elements) {
+          const n = el.tags?.name;
+          if (!n || !el.geometry) continue;
+          if (!byName[n]) byName[n] = [];
+          byName[n].push(el.geometry);
+        }
+        for (const name of batch) {
+          cacheSet(name, byName[name] ?? null);
+        }
+      } catch (e) {
+        console.error('Overpass error:', e);
+        statusEl.className = 'status error';
+        statusEl.innerHTML = '<b>Chyba pri načítaní dát.</b> Skús obnoviť stránku.';
+        return;
+      }
+    }
+  }
+
+  // Vykresli všetko z cache (synchronicky, žiadne čakanie)
+  statusEl.innerHTML = 'Vykresľujem mapu…';
   for (let i = 0; i < obvody.length; i++) {
     const obvod = obvody[i];
     for (const street of obvod.streets) {
       const listSpan = document.querySelector(`span[data-street="${street}"][data-idx="${i}"]`);
-      const isFromCache = cacheGet(street) !== undefined;
-      const result = await geocodeStreet(street);
-      
-      if (result) {
+      const ways = cacheGet(street);
+      if (ways && ways.length > 0) {
         totalFound++;
         if (listSpan) listSpan.className = 'found';
-        drawResult(result, street, obvod);
+        drawWays(ways, street, obvod);
         const cnt = document.getElementById(`cnt-${i}`);
-        const found = document.querySelectorAll(`#list-${i} span.found`).length;
-        cnt.textContent = `${found}/${obvod.streets.length}`;
+        cnt.textContent = `${document.querySelectorAll(`#list-${i} span.found`).length}/${obvod.streets.length}`;
       } else {
         if (listSpan) listSpan.className = 'notfound';
       }
       totalDone++;
-      prog.value = totalDone;
-      progtxt.textContent = `${totalDone}/${totalStreets} · nájdených ${totalFound}`;
-      
-      if (totalDone % 10 === 0) map.invalidateSize();
-
-      // Čakaj len keď sme skutočne volali API (nie z cache)
-      if (!isFromCache) {
-        await new Promise(r => setTimeout(r, 1200));
-      }
     }
   }
-  
+
   statusEl.className = 'status done';
-  if (totalFound > 0) {
-    statusEl.innerHTML = `<b>Hotovo.</b> Zobrazených ${totalFound} z ${totalStreets} ulíc. ` +
-      `Nenájdené ulice sú označené prázdnym krúžkom.`;
-    map.invalidateSize();
-    if (allBounds.length > 0) map.fitBounds(allBounds, { padding: [20, 20] });
-  } else {
-    statusEl.className = 'status error';
-    statusEl.innerHTML = '<b>Nenašli sa žiadne ulice.</b> Skús obnoviť stránku.';
-  }
+  statusEl.innerHTML = `<b>Hotovo.</b> Zobrazených ${totalFound} z ${totalStreets} ulíc.` +
+    (totalFound < totalStreets ? ' Nenájdené ulice sú označené prázdnym krúžkom.' : '');
+  map.invalidateSize();
+  if (allBounds.length > 0) map.fitBounds(allBounds, { padding: [20, 20] });
 }
 
 processAll();
