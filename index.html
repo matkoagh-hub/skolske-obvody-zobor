@@ -174,7 +174,7 @@ obvody.forEach((o, i) => {
 
 // Cache: undefined = nikdy nehľadané, null = nenájdené, array = nájdené (Overpass geometria)
 // Prefix v2 invaliduje starý Nominatim cache
-const CACHE_PFX = 'zobor4_';
+const CACHE_PFX = 'zobor5_';
 function cacheGet(key) {
   try {
     const raw = localStorage.getItem(CACHE_PFX + key);
@@ -284,16 +284,20 @@ function computePartialSplit(streetName, wayGeoms, addrNodes) {
 
 // ---- Overpass API ----
 
-// Bbox pre oblasť Zobor/Nitra.
-// Nitrianske Hrnčiarovce sú pri ~17.99°E — west limit 18.06 ich vylučuje.
-// Globálny [bbox] v Overpass orezáva geometriu ways na hranici boxu,
-// takže ulice presahujúce mimo oblast sa nakreslia len v relevantnej časti.
+// Bbox pre oblasť Zobor/Nitra — globálny [bbox] v Overpass orezáva geometriu
+// ways na hranici boxu, takže ulice presahujúce za hranicu sa nakreslia len
+// v relevantnej časti. Nitrianske Hrnčiarovce (samostatná obec) ležia pri
+// ~18.04°E, west limit 18.06 ich vylučuje.
 const ZOBOR_BBOX = '[bbox:48.27,18.06,48.41,18.20]';
+// Area filter obmedzí výber len na ulice v katastri Nitry (vylúči ulice
+// rovnakého mena v iných obciach v rámci bbox).
+const NITRA_AREA = `area["name"="Nitra"]["admin_level"="8"]->.nitra;`;
 
 async function fetchOverpass(streetNames) {
   const pattern = streetNames.map(escapeRegex).join('|');
   const query = `[out:json][timeout:90]${ZOBOR_BBOX};
-way["highway"]["name"~"^(${pattern})$"];
+${NITRA_AREA}
+way["highway"]["name"~"^(${pattern})$"](area.nitra);
 out geom;`;
   const resp = await fetch('https://overpass-api.de/api/interpreter', {
     method: 'POST',
@@ -307,9 +311,10 @@ out geom;`;
 // Pre rozdelené ulice: stiahni aj čísla domov (addr nodes)
 // addr:street regex ~"^name" zachytí aj "Jelenecká ulica" nielen "Jelenecká"
 async function fetchOverpassPartial(streetNames) {
-  const wayClauses  = streetNames.map(n => `way["highway"]["name"="${n}"];`).join('\n');
-  const addrClauses = streetNames.map(n => `node["addr:street"~"^${escapeRegex(n)}"];`).join('\n');
+  const wayClauses  = streetNames.map(n => `way["highway"]["name"="${n}"](area.nitra);`).join('\n');
+  const addrClauses = streetNames.map(n => `node["addr:street"~"^${escapeRegex(n)}"](area.nitra);`).join('\n');
   const query = `[out:json][timeout:90]${ZOBOR_BBOX};
+${NITRA_AREA}
 (\n${wayClauses}\n${addrClauses}\n);
 out geom;`;
   const resp = await fetch('https://overpass-api.de/api/interpreter', {
