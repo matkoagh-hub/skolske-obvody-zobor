@@ -92,8 +92,8 @@
     <div class="legend" id="legend"></div>
     <div id="details"></div>
     <p style="font-size:11px;opacity:0.6;margin-top:16px;">
-      Dáta: OpenStreetMap (Nominatim).<br>
-      <b>*</b> Hornozoborská a Jelenecká sú rozdelené medzi dva obvody podľa čísel domov — na mape sú zobrazené pod prvým obvodom v poradí.
+      Dáta: OpenStreetMap (Overpass API).<br>
+      Hornozoborská a Jelenecká sú rozdelené podľa čísel domov — na mape je vyznačená vždy len príslušná časť ulice.
     </p>
   </aside>
 </div>
@@ -104,12 +104,27 @@ const obvody = [
   { name: "MŠ Dobšinského 2885/8", color: "#e63946",
     streets: ["Astrová","Azalková","Bojnická","Buková","Burgundská","Černicová","Dobšinského","Dolnohorská","Drozdí chodník","Dubová","Fialková","Gaštanová","Gladiolová","Hornohorská","Hornozoborská","Hospodárska","Chatárska","Jahodová","Jelenecká","Kamenná","Kláštorská","Klinčeková","Ľaliová","Levanduľová","Malá kamenná","Malá podhájska","Malinová","Margarétková","Narcisová","Nécseyho","Nevädzová","Panská dolina","Pivonková","Pod lesom","Pod Lupkou","Podhájska","Poniklecová","Prvosienková","Ratkošova","Rekreačná","Slávičie chodníky","Snežienková","Šafranová","Tŕnistá","Turistická","Úzka","Veltlínska","Vendelínska","Viničná","Vyhliadková","Vysoká","Záhradkárska","Zvončeková"] },
   { name: "MŠ Vansovej 6", color: "#2a9d8f",
-    streets: ["Bartókova","Havrania","Hlohová","Hraničná","Jaseňová","Jastrabia","Kodályova","Krivánska","Kyjevská","Martinská dolina","Metodova","Moskovská","Orlia","Poľovnícka","Radová","Ríbezľová","Rosinského","Sirôtková","Sojčia","Sokolia","Tatarkova","Tolstého","Vansovej","Višňová","Vrania","Žibrická"] },
+    streets: ["Bartókova","Havrania","Hlohová","Hraničná","Hornozoborská","Jaseňová","Jastrabia","Jelenecká","Kodályova","Krivánska","Kyjevská","Martinská dolina","Metodova","Moskovská","Orlia","Poľovnícka","Radová","Ríbezľová","Rosinského","Sirôtková","Sojčia","Sokolia","Tatarkova","Tolstého","Vansovej","Višňová","Vrania","Žibrická"] },
   { name: "MŠ Platanová 3", color: "#f4a261",
     streets: ["Bažantia","Brestová","Broskyňová","Dolnozoborská","Dražovská","Hroznová","Chmeľová dolina","Jánskeho","Jazerná","Kľúčovského","Komenského","Malá strmá","Mandľová","Morušová","Muškátová","Nad baňou","Oravská","Orechová","Orgovánová","Oskorušová","Platanová","Pod Zlatým brehom","Podhorská","Pri jazierku","Rovná","Ružová","Silvánska","Skautská","Strmá","Studená","Sv. Beňadika","Svätoplukova","Svätourbanská","Tabaková","Tichá","Urbancova","Veterinárska","Vinohradnícka"] },
   { name: "MŠ Belopotockého 2", color: "#6a4c93",
     streets: ["Ambrova","Atlasova","Belopotockého","Cez panské","Dobrotka","Dolné Hony","Hamuljakova","Holubyho","Horeckého","Horná","Horné lúky","Hrabová","Jána Zelenáka","Kanálová","Kochova","Kultúrna","Lidická","Lukáčova","Lužianska","Mrázova","Na gruntoch","Na pasienkoch","Pekná","Pod kostolíkom","Pod Plieškou","Pri Dobrotke","Pri Jelšine","Pri Perinovej studni","Pri škole","Rozmarínová","Ščasného","Severná","Smreková","Šulekova","Švabinského","Topoľčianska","Vŕbová","Zoborská"] }
 ];
+
+// Ulice rozdelené medzi obvody podľa čísel domov
+// splitHouseOdd: hraničné nepárne číslo (Dobšinského ≤ toto, Vansovej > toto)
+const PARTIAL_STREETS = {
+  'Hornozoborská': {
+    splitHouseOdd: 137,
+    lowObvod: 'MŠ Dobšinského 2885/8', lowLabel: 'po č. 137 nepárne, po č. 82 párne',
+    highObvod: 'MŠ Vansovej 6',        highLabel: 'č. 141–167 nepárne, od č. 84 párne'
+  },
+  'Jelenecká': {
+    splitHouseOdd: 29,
+    lowObvod: 'MŠ Dobšinského 2885/8', lowLabel: 'č. 1–29 nepárne, všetky párne',
+    highObvod: 'MŠ Vansovej 6',        highLabel: 'od č. 31 nepárne'
+  }
+};
 
 const statusEl = document.getElementById('status');
 
@@ -179,9 +194,98 @@ function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// ---- Geometrické pomocníky pre rozdelené ulice ----
+
+// Najbližší bod na úseku AB ku bodu p; vracia t∈[0,1] a d² v °²
+function nearestOnSeg(p, a, b) {
+  const dx = b.lon - a.lon, dy = b.lat - a.lat, len2 = dx*dx + dy*dy;
+  if (len2 < 1e-20) return { t: 0, d2: (p.lon-a.lon)**2 + (p.lat-a.lat)**2 };
+  const t = Math.max(0, Math.min(1, ((p.lon-a.lon)*dx + (p.lat-a.lat)*dy) / len2));
+  return { t, d2: (p.lon - a.lon - t*dx)**2 + (p.lat - a.lat - t*dy)**2 };
+}
+
+// Zlúči way-segmenty (polia {lat,lon}) do súvislých reťazcov spájaním spoločných krajných bodov
+function mergeWaySegments(ways) {
+  const eps2 = 1e-10;
+  const chains = ways.map(w => [...w]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    outer: for (let i = 0; i < chains.length; i++) {
+      for (let j = i + 1; j < chains.length; j++) {
+        const A = chains[i], B = chains[j];
+        const sq = (a, b) => (a.lat-b.lat)**2 + (a.lon-b.lon)**2;
+        const aE = A[A.length-1], bE = B[B.length-1];
+        if      (sq(aE,   B[0]) < eps2) { chains[i] = [...A, ...B.slice(1)];                    chains.splice(j,1); changed=true; break outer; }
+        else if (sq(aE,   bE)   < eps2) { chains[i] = [...A, ...[...B].reverse().slice(1)];     chains.splice(j,1); changed=true; break outer; }
+        else if (sq(A[0], bE)   < eps2) { chains[i] = [...B, ...A.slice(1)];                    chains.splice(j,1); changed=true; break outer; }
+        else if (sq(A[0], B[0]) < eps2) { chains[i] = [...[...B].reverse(), ...A.slice(1)];     chains.splice(j,1); changed=true; break outer; }
+      }
+    }
+  }
+  return chains;
+}
+
+// Rozdeľ reťazec na dve časti v bode najbližšom k splitNode
+function splitChain(chain, splitNode) {
+  let bestSeg = 0, bestT = 0, bestD2 = Infinity;
+  for (let i = 0; i < chain.length - 1; i++) {
+    const { t, d2 } = nearestOnSeg(splitNode, chain[i], chain[i+1]);
+    if (d2 < bestD2) { bestD2 = d2; bestSeg = i; bestT = t; }
+  }
+  const sp = {
+    lat: chain[bestSeg].lat + bestT * (chain[bestSeg+1].lat - chain[bestSeg].lat),
+    lon: chain[bestSeg].lon + bestT * (chain[bestSeg+1].lon - chain[bestSeg].lon)
+  };
+  return {
+    before: [...chain.slice(0, bestSeg + 1), sp],
+    after:  [sp, ...chain.slice(bestSeg + 1)]
+  };
+}
+
+// Pre rozdelenú ulicu: zlúč ways, urči orientáciu podľa čísel domov, rozdeľ na low/high
+function computePartialSplit(streetName, wayGeoms, addrNodes) {
+  const cfg = PARTIAL_STREETS[streetName];
+
+  // Nájdi uzol s hraničným číslom (alebo ±2 susedné)
+  const byNum = {};
+  for (const n of addrNodes) {
+    const h = parseInt(n.tags?.['addr:housenumber']);
+    if (!isNaN(h)) byNum[h] = n;
+  }
+  const splitNode = byNum[cfg.splitHouseOdd] ?? byNum[cfg.splitHouseOdd + 2] ?? byNum[cfg.splitHouseOdd - 2];
+
+  if (!splitNode) {
+    console.warn(`Nenašiel sa deliaci bod pre ${streetName} (č. ${cfg.splitHouseOdd})`);
+    return { low: wayGeoms, high: [] };
+  }
+
+  const chains = mergeWaySegments(wayGeoms);
+
+  // Urči orientáciu: uzol s najnižším číslom domu má byť na začiatku reťazca
+  const nums = Object.keys(byNum).map(Number).sort((a, b) => a - b);
+  const lowestNode = byNum[nums[0]];
+  if (lowestNode) {
+    for (const chain of chains) {
+      const dFirst = (chain[0].lat - lowestNode.lat)**2 + (chain[0].lon - lowestNode.lon)**2;
+      const dLast  = (chain[chain.length-1].lat - lowestNode.lat)**2 + (chain[chain.length-1].lon - lowestNode.lon)**2;
+      if (dLast < dFirst) chain.reverse();
+    }
+  }
+
+  const low = [], high = [];
+  for (const chain of chains) {
+    const { before, after } = splitChain(chain, splitNode);
+    if (before.length >= 2) low.push(before);
+    if (after.length >= 2) high.push(after);
+  }
+  return { low, high };
+}
+
+// ---- Overpass API ----
+
 async function fetchOverpass(streetNames) {
   const pattern = streetNames.map(escapeRegex).join('|');
-  // bbox: juh,západ,sever,východ — oblasť Nitra/Zobor
   const query = `[out:json][timeout:90][bbox:48.28,18.02,48.40,18.20];
 way["highway"]["name"~"^(${pattern})$"];
 out geom;`;
@@ -194,8 +298,26 @@ out geom;`;
   return resp.json();
 }
 
-function drawWays(wayGeometries, streetName, obvod) {
-  const popup = `<b>${streetName}</b><br>${obvod.name}`;
+// Pre rozdelené ulice: stiahni aj čísla domov (addr nodes)
+async function fetchOverpassPartial(streetNames) {
+  const wayClauses  = streetNames.map(n => `way["highway"]["name"="${n}"];`).join('\n');
+  const addrClauses = streetNames.map(n => `node["addr:street"="${n}"]["addr:housenumber"];`).join('\n');
+  const query = `[out:json][timeout:90][bbox:48.28,18.02,48.40,18.20];
+(\n${wayClauses}\n${addrClauses}\n);
+out geom;`;
+  const resp = await fetch('https://overpass-api.de/api/interpreter', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'data=' + encodeURIComponent(query)
+  });
+  if (!resp.ok) throw new Error(`Overpass ${resp.status}`);
+  return resp.json();
+}
+
+function drawWays(wayGeometries, streetName, obvod, sublabel) {
+  const popup = sublabel
+    ? `<b>${streetName}</b><br>${obvod.name}<br><small>${sublabel}</small>`
+    : `<b>${streetName}</b><br>${obvod.name}`;
   for (const geom of wayGeometries) {
     const coords = geom.map(pt => [pt.lat, pt.lon]);
     allBounds.push(coords[0], coords[coords.length - 1]);
@@ -205,23 +327,49 @@ function drawWays(wayGeometries, streetName, obvod) {
 }
 
 async function processAll() {
-  // Zisti ktoré ulice nie sú v cache
-  const uniqueNames = [...new Set(obvody.flatMap(o => o.streets))];
-  const uncached = uniqueNames.filter(n => cacheGet(n) === undefined);
+  const PARTIAL_NAMES = new Set(Object.keys(PARTIAL_STREETS));
 
-  if (uncached.length > 0) {
-    // Stiahni v dávkach po 60 (dlhý regex môže spomaľovať Overpass)
+  // 1. Rozdelené ulice — ways + čísla domov v jednom requeste
+  const uncachedPartial = Object.keys(PARTIAL_STREETS).filter(n =>
+    cacheGet(n + '|low') === undefined || cacheGet(n + '|high') === undefined
+  );
+  if (uncachedPartial.length > 0) {
+    statusEl.innerHTML = 'Sťahujem dáta pre rozdelené ulice…';
+    try {
+      const data = await fetchOverpassPartial(uncachedPartial);
+      for (const streetName of uncachedPartial) {
+        const wayGeoms = [], addrNodes = [];
+        for (const el of data.elements) {
+          if (el.type === 'way'  && el.tags?.name === streetName && el.geometry)
+            wayGeoms.push(el.geometry);
+          if (el.type === 'node' && el.tags?.['addr:street'] === streetName)
+            addrNodes.push(el);
+        }
+        const { low, high } = computePartialSplit(streetName, wayGeoms, addrNodes);
+        cacheSet(streetName + '|low',  low.length  > 0 ? low  : null);
+        cacheSet(streetName + '|high', high.length > 0 ? high : null);
+      }
+    } catch (e) {
+      console.error('Overpass chyba (rozdelené ulice):', e);
+      statusEl.className = 'status error';
+      statusEl.innerHTML = '<b>Chyba pri načítaní dát.</b> Skús obnoviť stránku.';
+      return;
+    }
+  }
+
+  // 2. Bežné ulice — v dávkach po 60
+  const uniqueRegular = [...new Set(obvody.flatMap(o => o.streets).filter(s => !PARTIAL_NAMES.has(s)))];
+  const uncachedRegular = uniqueRegular.filter(n => cacheGet(n) === undefined);
+  if (uncachedRegular.length > 0) {
     const BATCH = 60;
-    const batches = Math.ceil(uncached.length / BATCH);
-    for (let b = 0; b < uncached.length; b += BATCH) {
-      const batch = uncached.slice(b, b + BATCH);
-      const batchNum = Math.floor(b / BATCH) + 1;
+    const batches = Math.ceil(uncachedRegular.length / BATCH);
+    for (let b = 0; b < uncachedRegular.length; b += BATCH) {
+      const batch = uncachedRegular.slice(b, b + BATCH);
       statusEl.innerHTML = batches > 1
-        ? `Sťahujem dáta… dávka ${batchNum}/${batches}`
-        : `Sťahujem dáta pre ${uncached.length} ulíc z OpenStreetMap…`;
+        ? `Sťahujem dáta… dávka ${Math.floor(b/BATCH)+1}/${batches}`
+        : `Sťahujem dáta pre ${uncachedRegular.length} ulíc z OpenStreetMap…`;
       try {
         const data = await fetchOverpass(batch);
-        // Zoskup cesty podľa mena; ulož len geometriu (šetrí miesto v cache)
         const byName = {};
         for (const el of data.elements) {
           const n = el.tags?.name;
@@ -229,11 +377,9 @@ async function processAll() {
           if (!byName[n]) byName[n] = [];
           byName[n].push(el.geometry);
         }
-        for (const name of batch) {
-          cacheSet(name, byName[name] ?? null);
-        }
+        for (const name of batch) cacheSet(name, byName[name] ?? null);
       } catch (e) {
-        console.error('Overpass error:', e);
+        console.error('Overpass chyba:', e);
         statusEl.className = 'status error';
         statusEl.innerHTML = '<b>Chyba pri načítaní dát.</b> Skús obnoviť stránku.';
         return;
@@ -241,17 +387,25 @@ async function processAll() {
     }
   }
 
-  // Vykresli všetko z cache (synchronicky, žiadne čakanie)
+  // 3. Vykresli všetko z cache
   statusEl.innerHTML = 'Vykresľujem mapu…';
   for (let i = 0; i < obvody.length; i++) {
     const obvod = obvody[i];
     for (const street of obvod.streets) {
       const listSpan = document.querySelector(`span[data-street="${street}"][data-idx="${i}"]`);
-      const ways = cacheGet(street);
+      let ways, sublabel;
+      if (PARTIAL_NAMES.has(street)) {
+        const cfg = PARTIAL_STREETS[street];
+        const isLow = obvod.name === cfg.lowObvod;
+        ways = cacheGet(street + (isLow ? '|low' : '|high'));
+        sublabel = isLow ? cfg.lowLabel : cfg.highLabel;
+      } else {
+        ways = cacheGet(street);
+      }
       if (ways && ways.length > 0) {
         totalFound++;
         if (listSpan) listSpan.className = 'found';
-        drawWays(ways, street, obvod);
+        drawWays(ways, street, obvod, sublabel);
         const cnt = document.getElementById(`cnt-${i}`);
         cnt.textContent = `${document.querySelectorAll(`#list-${i} span.found`).length}/${obvod.streets.length}`;
       } else {
